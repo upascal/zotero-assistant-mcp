@@ -41,5 +41,6 @@
       "placeholder": "12345678"
     }
   ],
+  "config": [],
   "autoSecrets": ["BEARER_TOKEN"]
 }
