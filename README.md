@@ -2,10 +2,35 @@
 
 Zotero library management MCP server for Cloudflare Workers, designed for deployment via [mcp-deploy](https://github.com/upascal/mcp-deploy).
 
-Tools for searching, reading, writing, and managing your Zotero library:
-- **Search & Browse** — search items, list collections, browse tags, get recent items
-- **Read** — get item metadata, full-text content, attachment content
-- **Write** — save items with metadata + attachments, create notes, update items
+## Tools (15)
+
+**Search & Browse**
+- `search_items` — search by text, tags, type, collection, or date range
+- `get_collection_items` — list items in a specific collection
+- `list_collections` — list all collections (folders)
+- `create_collection` — create a new collection
+- `list_tags` — list tags with item counts
+- `get_library_stats` — library overview with totals and top tags
+
+**Read**
+- `get_item` — full metadata and children for a single item
+- `read_attachment` — read attachment content (auto-detects type, accepts parent or attachment key)
+- `get_note` — read note content
+
+**Write**
+- `save_item` — create an item with metadata and optional attachment (PDF URL, snapshot, or base64 file)
+- `attach` — attach a file to an existing item (supports `pdf_url`, `snapshot_url`, or `file` via base64)
+- `create_note` — create a note on an existing item
+- `update_item` — update metadata, tags, or collections
+- `trash_item` — move a note or attachment to trash
+
+## Features
+
+- **Server instructions** — workflow guidance injected once at init, not per-tool
+- **Progress notifications** — multi-step operations (attach, save with attachment, read) emit MCP progress events
+- **Group library support** — set `ZOTERO_LIBRARY_TYPE=group` for shared libraries
+- **Smart author parsing** — handles "Last, First", suffixes (Jr., III), and institutional authors
+- **Curated responses** — `get_item` returns only non-empty, agent-relevant fields; search results are compact summaries
 
 ## How it works
 
@@ -13,6 +38,14 @@ This repo contains only MCP logic. Auth, deployment, and UI are handled by mcp-d
 
 - `src/` — MCP server code (Cloudflare Workers + Durable Objects)
 - `mcp-deploy.json` — deployment contract (secrets, config, worker settings)
+
+## Configuration
+
+| Secret/Config | Required | Description |
+|---|---|---|
+| `ZOTERO_API_KEY` | Yes | [Zotero API key](https://www.zotero.org/settings/keys) |
+| `ZOTERO_LIBRARY_ID` | Yes | Numeric user or group library ID |
+| `ZOTERO_LIBRARY_TYPE` | No | `user` (default) or `group` |
 
 ## Local development
 
@@ -24,21 +57,7 @@ npm install
 # ZOTERO_LIBRARY_ID=your-library-id
 
 npx wrangler dev
-# Health check: http://localhost:8787/
 ```
-
-Get your credentials at https://www.zotero.org/settings/keys
-
-## Release
-
-Tag a version to trigger the GitHub Actions release workflow:
-
-```bash
-git tag v0.3.0
-git push --tags
-```
-
-This builds `worker.mjs` and publishes it alongside `mcp-deploy.json` as release assets. mcp-deploy fetches these assets to deploy the worker.
 
 ## Testing
 
@@ -46,11 +65,15 @@ This builds `worker.mjs` and publishes it alongside `mcp-deploy.json` as release
 npm test
 ```
 
-Integration tests require a live Zotero library. Set `.dev.vars` with your credentials:
+Integration tests run against a live Zotero library. Set `.dev.vars` with your credentials. Tests create temporary items/collections and clean up after themselves.
 
-```
-ZOTERO_API_KEY=your-api-key
-ZOTERO_LIBRARY_ID=your-library-id
+## Release
+
+Tag a version to trigger the GitHub Actions release workflow:
+
+```bash
+git tag v0.4.0
+git push --tags
 ```
 
-Tests create temporary items/collections and clean up after themselves.
+This builds `worker.mjs` and publishes it alongside `mcp-deploy.json` as release assets. mcp-deploy fetches these assets to deploy the worker.
