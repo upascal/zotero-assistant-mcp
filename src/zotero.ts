@@ -120,14 +120,28 @@ function unwrapUrl(raw: string): string {
 // Zotero client factory
 // -------------------------------------------------------------------------
 
-let _libraryType = "user";
-
-export function setLibraryType(type: string) {
-  _libraryType = type;
+function zotClient(apiKey: string, libraryId: string, groupId?: string) {
+  if (groupId) {
+    return api(apiKey).library("group", groupId);
+  }
+  return api(apiKey).library("user", libraryId);
 }
 
-function zotClient(apiKey: string, libraryId: string) {
-  return api(apiKey).library(_libraryType, libraryId);
+// -------------------------------------------------------------------------
+// Groups
+// -------------------------------------------------------------------------
+
+export async function listGroups(apiKey: string, libraryId: string) {
+  const zot = zotClient(apiKey, libraryId);
+  const response = await zot.groups().get();
+  const raw = response.raw;
+  return raw.map((g: any) => ({
+    id: String(g.id),
+    name: g.data.name,
+    type: g.data.type,
+    owner: g.data.owner,
+    numItems: g.meta?.numItems ?? null,
+  }));
 }
 
 // -------------------------------------------------------------------------
@@ -175,8 +189,8 @@ function formatItemSummary(raw: any): ItemSummary {
 // Collections
 // -------------------------------------------------------------------------
 
-export async function listCollections(apiKey: string, libraryId: string) {
-  const zot = zotClient(apiKey, libraryId);
+export async function listCollections(apiKey: string, libraryId: string, groupId?: string) {
+  const zot = zotClient(apiKey, libraryId, groupId);
   const response = await zot.collections().get();
   const raw = response.raw;
   return raw.map((c: any) => ({
@@ -190,13 +204,14 @@ export async function createCollection(
   apiKey: string,
   libraryId: string,
   name: string,
-  parentCollectionId?: string
+  parentCollectionId?: string,
+  groupId?: string
 ) {
   if (!name || !name.trim()) {
     return { success: false, error: "Collection name is required" };
   }
 
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   const data: any = { name: name.trim() };
   if (parentCollectionId) {
     data.parentCollection = parentCollectionId;
@@ -268,6 +283,7 @@ interface CreateItemParams {
   fileBase64?: string;
   fileName?: string;
   extra?: string;
+  groupId?: string;
 }
 
 export async function createItem(
@@ -295,6 +311,7 @@ export async function createItem(
     fileBase64,
     fileName,
     extra,
+    groupId,
   } = params;
 
   const zoteroType = resolveItemType(itemType);
@@ -348,7 +365,7 @@ export async function createItem(
 
   onProgress?.(1, totalSteps, `Creating ${zoteroType}: "${title}"`);
 
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const response = await zot.items().post([template]);
 
@@ -371,27 +388,17 @@ export async function createItem(
     if (pdfUrl) {
       onProgress?.(2, totalSteps, `Attaching PDF from URL`);
       result.pdf_attachment = await attachPdfFromUrl(
-        apiKey,
-        libraryId,
-        itemKey,
-        pdfUrl
+        apiKey, libraryId, itemKey, pdfUrl, undefined, undefined, groupId
       );
     } else if (snapshotUrl) {
       onProgress?.(2, totalSteps, `Attaching webpage snapshot`);
       result.snapshot_attachment = await attachSnapshot(
-        apiKey,
-        libraryId,
-        itemKey,
-        snapshotUrl
+        apiKey, libraryId, itemKey, snapshotUrl, undefined, undefined, groupId
       );
     } else if (fileBase64 && fileName) {
       onProgress?.(2, totalSteps, `Attaching file: ${fileName}`);
       result.file_attachment = await attachFile(
-        apiKey,
-        libraryId,
-        itemKey,
-        fileName,
-        fileBase64
+        apiKey, libraryId, itemKey, fileName, fileBase64, undefined, undefined, undefined, groupId
       );
     }
 
@@ -437,7 +444,8 @@ export async function attachFile(
   contentBase64: string,
   contentType?: string,
   title?: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  groupId?: string
 ) {
   try {
     const buffer = Buffer.from(contentBase64, "base64");
@@ -454,7 +462,7 @@ export async function attachFile(
       `[attach_file] Attaching ${filename} (${buffer.length} bytes, ${resolvedContentType}) to ${parentItemKey}`
     );
 
-    const zot = zotClient(apiKey, libraryId);
+    const zot = zotClient(apiKey, libraryId, groupId);
     const attachmentTemplate = {
       itemType: "attachment",
       parentItem: parentItemKey,
@@ -528,7 +536,8 @@ export async function attachPdfFromUrl(
   parentItemKey: string,
   pdfUrl: string,
   filename?: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  groupId?: string
 ) {
   pdfUrl = unwrapUrl(pdfUrl);
 
@@ -586,7 +595,7 @@ export async function attachPdfFromUrl(
     onProgress?.(2, 3, `Creating attachment item: ${filename}`);
 
     // Upload via Zotero API
-    const zot = zotClient(apiKey, libraryId);
+    const zot = zotClient(apiKey, libraryId, groupId);
     const attachmentTemplate = {
       itemType: "attachment",
       parentItem: parentItemKey,
@@ -660,7 +669,8 @@ export async function attachSnapshot(
   parentItemKey: string,
   url: string,
   title?: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  groupId?: string
 ) {
   url = unwrapUrl(url);
 
@@ -725,7 +735,7 @@ export async function attachSnapshot(
     const buffer = Buffer.from(html, "utf-8");
 
     // Upload via Zotero API
-    const zot = zotClient(apiKey, libraryId);
+    const zot = zotClient(apiKey, libraryId, groupId);
     const attachmentTemplate = {
       itemType: "attachment",
       parentItem: parentItemKey,
@@ -813,6 +823,7 @@ interface SearchParams {
   offset?: number;
   dateFrom?: string;
   dateTo?: string;
+  groupId?: string;
 }
 
 export async function searchItems(
@@ -832,10 +843,11 @@ export async function searchItems(
     offset = 0,
     dateFrom,
     dateTo,
+    groupId,
   } = params;
 
   const hasDateFilter = dateFrom || dateTo;
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
 
   // When date filtering, we fetch more items and filter client-side
   // since the Zotero API doesn't support date range params
@@ -898,9 +910,10 @@ export async function searchItems(
 export async function getItem(
   apiKey: string,
   libraryId: string,
-  itemKey: string
+  itemKey: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const [itemResp, childrenResp] = await Promise.all([
       zot.items(itemKey).get(),
@@ -952,9 +965,10 @@ export async function getItem(
 export async function getItemFulltext(
   apiKey: string,
   libraryId: string,
-  itemKey: string
+  itemKey: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     // First check if this item has fulltext directly
     try {
@@ -1012,9 +1026,10 @@ export async function readAttachment(
   apiKey: string,
   libraryId: string,
   itemKey: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     onProgress?.(1, 2, `Fetching item metadata`);
     const itemResp = await zot.items(itemKey).get();
@@ -1041,7 +1056,7 @@ export async function readAttachment(
       for (const att of attachments) {
         const ct = att.data?.contentType || "";
         if (ct.includes("html") || ct.includes("text") || ct.includes("xml") || ct.includes("json") || ct.includes("markdown")) {
-          const result = await getAttachmentContent(apiKey, libraryId, att.key);
+          const result = await getAttachmentContent(apiKey, libraryId, att.key, groupId);
           if (result.content) return { ...result, parent_item_key: itemKey };
         }
       }
@@ -1087,7 +1102,7 @@ export async function readAttachment(
 
       // Text-based: download and return content
       if (ct.includes("html") || ct.includes("text") || ct.includes("xml") || ct.includes("json") || ct.includes("markdown")) {
-        return await getAttachmentContent(apiKey, libraryId, itemKey);
+        return await getAttachmentContent(apiKey, libraryId, itemKey, groupId);
       }
 
       // Binary (PDF etc): try fulltext extraction
@@ -1135,9 +1150,10 @@ export async function getCollectionItems(
     direction = "desc",
     limit = 25,
     offset = 0,
-  }: { sort?: string; direction?: string; limit?: number; offset?: number }
+  }: { sort?: string; direction?: string; limit?: number; offset?: number },
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const response = await zot
       .collections(collectionId)
@@ -1170,9 +1186,10 @@ export async function getCollectionItems(
 export async function listTags(
   apiKey: string,
   libraryId: string,
-  { limit = 100, offset = 0 }: { limit?: number; offset?: number }
+  { limit = 100, offset = 0 }: { limit?: number; offset?: number },
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const response = await zot.tags().get({ limit, start: offset });
     const tags = (response.raw || []).map((t: any) => ({
@@ -1188,9 +1205,10 @@ export async function listTags(
 export async function getRecentItems(
   apiKey: string,
   libraryId: string,
-  { limit = 10, sort = "dateAdded" }: { limit?: number; sort?: string }
+  { limit = 10, sort = "dateAdded" }: { limit?: number; sort?: string },
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const response = await zot
       .items()
@@ -1217,9 +1235,10 @@ export async function createNote(
   libraryId: string,
   parentItemKey: string,
   content: string,
-  tags: string[] = []
+  tags: string[] = [],
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const template = await getItemTemplate("note");
     template.parentItem = parentItemKey;
@@ -1250,9 +1269,10 @@ export async function createNote(
 export async function getNoteContent(
   apiKey: string,
   libraryId: string,
-  itemKey: string
+  itemKey: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const itemResp = await zot.items(itemKey).get();
     const raw = itemResp.raw;
@@ -1299,9 +1319,10 @@ export async function getNoteContent(
 export async function getAttachmentContent(
   apiKey: string,
   libraryId: string,
-  itemKey: string
+  itemKey: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     // First get the attachment metadata to know what we're dealing with
     const itemResp = await zot.items(itemKey).get();
@@ -1318,9 +1339,10 @@ export async function getAttachmentContent(
     const filename = data.filename || data.title || "unknown";
 
     // Download the file content
-    const libPrefix = _libraryType === "group" ? "groups" : "users";
+    const libPrefix = groupId ? "groups" : "users";
+    const libId = groupId || libraryId;
     const fileResp = await fetch(
-      `https://api.zotero.org/${libPrefix}/${libraryId}/items/${itemKey}/file`,
+      `https://api.zotero.org/${libPrefix}/${libId}/items/${itemKey}/file`,
       {
         headers: { "Zotero-API-Key": apiKey },
         signal: AbortSignal.timeout(60000),
@@ -1375,14 +1397,15 @@ export async function getAttachmentContent(
 
 export async function getLibraryStats(
   apiKey: string,
-  libraryId: string
+  libraryId: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     // Run queries in parallel for efficiency
     const [itemsResp, collectionsResult, tagsResp] = await Promise.all([
       zot.items().top().get({ limit: 1, sort: "dateModified", direction: "desc" }),
-      listCollections(apiKey, libraryId),
+      listCollections(apiKey, libraryId, groupId),
       zot.tags().get({ limit: 100, sort: "numItems", direction: "desc" }),
     ]);
 
@@ -1434,9 +1457,10 @@ export async function getLibraryStats(
 export async function trashItem(
   apiKey: string,
   libraryId: string,
-  itemKey: string
+  itemKey: string,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     // First verify this is a note or attachment (safety check)
     const itemResp = await zot.items(itemKey).get();
@@ -1492,9 +1516,10 @@ export async function updateItem(
   apiKey: string,
   libraryId: string,
   itemKey: string,
-  changes: UpdateChanges
+  changes: UpdateChanges,
+  groupId?: string
 ) {
-  const zot = zotClient(apiKey, libraryId);
+  const zot = zotClient(apiKey, libraryId, groupId);
   try {
     const itemResp = await zot.items(itemKey).get();
     const raw = itemResp.raw;

@@ -2,7 +2,10 @@
 
 Zotero library management MCP server for Cloudflare Workers, designed for deployment via [mcp-deploy](https://github.com/upascal/mcp-deploy).
 
-## Tools (15)
+## Tools (16)
+
+**Groups**
+- `list_groups` — list Zotero groups the user belongs to (returns group IDs for use with `group_id` params)
 
 **Search & Browse**
 - `search_items` — search by text, tags, type, collection, or date range
@@ -24,28 +27,42 @@ Zotero library management MCP server for Cloudflare Workers, designed for deploy
 - `update_item` — update metadata, tags, or collections
 - `trash_item` — move a note or attachment to trash
 
+All tools that operate on library data accept an optional `group_id` parameter. Omit it for the personal library; pass a group ID (from `list_groups`) to operate on a group library.
+
 ## Features
 
 - **Server instructions** — workflow guidance injected once at init, not per-tool
 - **Progress notifications** — multi-step operations (attach, save with attachment, read) emit MCP progress events
-- **Group library support** — set `ZOTERO_LIBRARY_TYPE=group` for shared libraries
+- **Group library support** — call `list_groups` to discover groups, pass `group_id` to any tool
 - **Smart author parsing** — handles "Last, First", suffixes (Jr., III), and institutional authors
 - **Curated responses** — `get_item` returns only non-empty, agent-relevant fields; search results are compact summaries
 
+## Deploy
+
+Install [mcp-deploy](https://github.com/upascal/mcp-deploy) and deploy to Cloudflare Workers:
+
+```bash
+npm install -g mcp-deploy
+mcp-deploy login
+mcp-deploy add upascal/zotero-assistant-mcp
+mcp-deploy deploy zotero-assistant-mcp
+```
+
+Or use the web UI: `mcp-deploy gui`
+
 ## How it works
 
-This repo contains only MCP logic. Auth, deployment, and UI are handled by mcp-deploy. The repo ships:
+This repo contains only MCP logic. Auth, deployment, and UI are handled by [mcp-deploy](https://github.com/upascal/mcp-deploy) (`npm install -g mcp-deploy`). The repo ships:
 
 - `src/` — MCP server code (Cloudflare Workers + Durable Objects)
 - `mcp-deploy.json` — deployment contract (secrets, config, worker settings)
 
 ## Configuration
 
-| Secret/Config | Required | Description |
+| Secret | Required | Description |
 |---|---|---|
 | `ZOTERO_API_KEY` | Yes | [Zotero API key](https://www.zotero.org/settings/keys) |
-| `ZOTERO_LIBRARY_ID` | Yes | Numeric user or group library ID |
-| `ZOTERO_LIBRARY_TYPE` | No | `user` (default) or `group` |
+| `ZOTERO_LIBRARY_ID` | Yes | Your numeric user library ID |
 
 ## Local development
 
@@ -72,7 +89,7 @@ Integration tests run against a live Zotero library. Set `.dev.vars` with your c
 Tag a version to trigger the GitHub Actions release workflow:
 
 ```bash
-git tag v0.4.0
+git tag v0.5.0
 git push --tags
 ```
 

@@ -36,6 +36,7 @@ globalThis.fetch = function patchedFetch(
 
 import {
   listCollections,
+  listGroups,
   createItem,
   attachPdfFromUrl,
   attachFile,
@@ -50,7 +51,6 @@ import {
   getLibraryStats,
   getNoteContent,
   readAttachment,
-  setLibraryType,
   trashItem,
   type ProgressCallback,
 } from "./zotero.js";
@@ -103,7 +103,12 @@ AUTHORS: Can be personal names ("Jane Smith") or organizations ("WHO", "World He
 
 UPDATING: update_item accepts any combination of: title, url, doi, publication, volume, issue, pages, creators, abstract, date, extra, and tag/collection operations (add_tags, remove_tags, tags, add_collections, remove_collections, collections).
 
-CREATORS FORMAT: Use firstName/lastName for people, name for institutions. creatorType defaults to "author" (also: editor, translator, contributor).`;
+CREATORS FORMAT: Use firstName/lastName for people, name for institutions. creatorType defaults to "author" (also: editor, translator, contributor).
+
+GROUPS:
+- Call list_groups to discover available groups and their IDs
+- Pass group_id to any tool to operate on a group library instead of the personal library
+- Omit group_id to use the personal library (default)`;
 
 // -------------------------------------------------------------------------
 // McpAgent — Durable Object that serves the MCP protocol
@@ -112,15 +117,11 @@ CREATORS FORMAT: Use firstName/lastName for people, name for institutions. creat
 export class ZoteroMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "zotero-assistant",
-    version: "0.4.0",
+    version: "0.5.0",
     instructions: SERVER_INSTRUCTIONS,
   });
 
   async init() {
-    // Configure library type (user or group)
-    const libraryType = (this.env as any).ZOTERO_LIBRARY_TYPE || "user";
-    setLibraryType(libraryType);
-
     const getCredentials = () => {
       const apiKey = this.env.ZOTERO_API_KEY;
       const libraryId = this.env.ZOTERO_LIBRARY_ID;
@@ -132,6 +133,30 @@ export class ZoteroMCP extends McpAgent<Env> {
       }
       return { apiKey, libraryId };
     };
+
+    // =====================================================================
+    // Groups
+    // =====================================================================
+
+    this.server.tool(
+      "list_groups",
+      "List Zotero groups the user belongs to. Returns group IDs for use with group_id params.",
+      async () => {
+        const { apiKey, libraryId } = getCredentials();
+        try {
+          const groups = await listGroups(apiKey, libraryId);
+          return {
+            content: [{ type: "text", text: JSON.stringify(groups, null, 2) }],
+          };
+        } catch (err: any) {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify({ success: false, error: err.message }) },
+            ],
+          };
+        }
+      }
+    );
 
     // =====================================================================
     // Search & Browse
@@ -158,6 +183,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         offset: z.number().min(0).default(0).describe("Pagination offset"),
         date_from: z.string().optional().describe("Items added on/after (YYYY-MM-DD)"),
         date_to: z.string().optional().describe("Items added on/before (YYYY-MM-DD)"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -173,6 +199,7 @@ export class ZoteroMCP extends McpAgent<Env> {
           offset: params.offset,
           dateFrom: params.date_from,
           dateTo: params.date_to,
+          groupId: params.group_id,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -189,6 +216,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         direction: z.enum(["asc", "desc"]).default("desc").describe("Sort direction"),
         limit: z.number().min(1).max(100).default(25).describe("Max results"),
         offset: z.number().min(0).default(0).describe("Pagination offset"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -201,7 +229,8 @@ export class ZoteroMCP extends McpAgent<Env> {
             direction: params.direction,
             limit: params.limit,
             offset: params.offset,
-          }
+          },
+          params.group_id
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -212,10 +241,13 @@ export class ZoteroMCP extends McpAgent<Env> {
     this.server.tool(
       "list_collections",
       "List all collections (folders) in the library.",
-      async () => {
+      {
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
+      },
+      async (params) => {
         const { apiKey, libraryId } = getCredentials();
         try {
-          const collections = await listCollections(apiKey, libraryId);
+          const collections = await listCollections(apiKey, libraryId, params.group_id);
           return {
             content: [
               { type: "text", text: JSON.stringify(collections, null, 2) },
@@ -237,10 +269,11 @@ export class ZoteroMCP extends McpAgent<Env> {
       {
         name: z.string().describe("Collection name"),
         parent_collection_id: z.string().optional().describe("Parent collection key for nesting"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
-      async ({ name, parent_collection_id }) => {
+      async ({ name, parent_collection_id, group_id }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await createCollection(apiKey, libraryId, name, parent_collection_id);
+        const result = await createCollection(apiKey, libraryId, name, parent_collection_id, group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -253,13 +286,14 @@ export class ZoteroMCP extends McpAgent<Env> {
       {
         limit: z.number().min(1).max(500).default(100).describe("Max tags"),
         offset: z.number().min(0).default(0).describe("Pagination offset"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
         const result = await listTags(apiKey, libraryId, {
           limit: params.limit,
           offset: params.offset,
-        });
+        }, params.group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -269,9 +303,12 @@ export class ZoteroMCP extends McpAgent<Env> {
     this.server.tool(
       "get_library_stats",
       "Library overview: total items, collections, top tags, and last modified item.",
-      async () => {
+      {
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
+      },
+      async (params) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await getLibraryStats(apiKey, libraryId);
+        const result = await getLibraryStats(apiKey, libraryId, params.group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -287,10 +324,11 @@ export class ZoteroMCP extends McpAgent<Env> {
       "Get full metadata and children for a single item.",
       {
         item_key: z.string().describe("Zotero item key"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
-      async ({ item_key }) => {
+      async ({ item_key, group_id }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await getItem(apiKey, libraryId, item_key);
+        const result = await getItem(apiKey, libraryId, item_key, group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -302,11 +340,12 @@ export class ZoteroMCP extends McpAgent<Env> {
       "Read attachment content. Accepts parent item key or attachment key — auto-detects type and extracts content.",
       {
         item_key: z.string().describe("Parent item key or attachment key"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
-      async ({ item_key }, extra) => {
+      async ({ item_key, group_id }, extra) => {
         const { apiKey, libraryId } = getCredentials();
         const onProgress = makeProgressReporter(extra);
-        const result = await readAttachment(apiKey, libraryId, item_key, onProgress);
+        const result = await readAttachment(apiKey, libraryId, item_key, onProgress, group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -318,10 +357,11 @@ export class ZoteroMCP extends McpAgent<Env> {
       "Read note content. Pass a note key for one note, or a parent item key for all child notes.",
       {
         item_key: z.string().describe("Note or parent item key"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
-      async ({ item_key }) => {
+      async ({ item_key, group_id }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await getNoteContent(apiKey, libraryId, item_key);
+        const result = await getNoteContent(apiKey, libraryId, item_key, group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -354,6 +394,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         file_base64: z.string().optional().describe("Base64 file content to attach"),
         file_name: z.string().optional().describe("Filename for base64 attachment"),
         extra: z.string().optional().describe("Extra field content"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params, extra) => {
         const { apiKey, libraryId } = getCredentials();
@@ -377,6 +418,7 @@ export class ZoteroMCP extends McpAgent<Env> {
           fileBase64: params.file_base64,
           fileName: params.file_name,
           extra: params.extra,
+          groupId: params.group_id,
         }, onProgress);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -397,6 +439,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         filename: z.string().optional().describe("Filename"),
         title: z.string().optional().describe("Display title"),
         content_type: z.string().optional().describe("MIME type (auto-detected if omitted)"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params, extra) => {
         const { apiKey, libraryId } = getCredentials();
@@ -406,15 +449,15 @@ export class ZoteroMCP extends McpAgent<Env> {
         switch (params.source_type) {
           case "pdf_url":
             if (!params.url) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "url is required for pdf_url type" }) }] };
-            result = await attachPdfFromUrl(apiKey, libraryId, params.parent_item_key, params.url, params.filename, onProgress);
+            result = await attachPdfFromUrl(apiKey, libraryId, params.parent_item_key, params.url, params.filename, onProgress, params.group_id);
             break;
           case "snapshot_url":
             if (!params.url) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "url is required for snapshot_url type" }) }] };
-            result = await attachSnapshot(apiKey, libraryId, params.parent_item_key, params.url, params.title, onProgress);
+            result = await attachSnapshot(apiKey, libraryId, params.parent_item_key, params.url, params.title, onProgress, params.group_id);
             break;
           case "file":
             if (!params.content_base64 || !params.filename) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "content_base64 and filename are required for file type" }) }] };
-            result = await attachFile(apiKey, libraryId, params.parent_item_key, params.filename, params.content_base64, params.content_type, params.title, onProgress);
+            result = await attachFile(apiKey, libraryId, params.parent_item_key, params.filename, params.content_base64, params.content_type, params.title, onProgress, params.group_id);
             break;
         }
 
@@ -431,6 +474,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         item_key: z.string().describe("Parent item key"),
         content: z.string().describe("Note text (HTML supported)"),
         tags: z.array(z.string()).optional().describe("Tags"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -439,7 +483,8 @@ export class ZoteroMCP extends McpAgent<Env> {
           libraryId,
           params.item_key,
           params.content,
-          params.tags || []
+          params.tags || [],
+          params.group_id
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -479,6 +524,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         abstract: z.string().optional().describe("Abstract"),
         date: z.string().optional().describe("Date"),
         extra: z.string().optional().describe("Extra field"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -500,7 +546,7 @@ export class ZoteroMCP extends McpAgent<Env> {
           abstract: params.abstract,
           date: params.date,
           extra: params.extra,
-        });
+        }, params.group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -512,10 +558,11 @@ export class ZoteroMCP extends McpAgent<Env> {
       "Move a note or attachment to trash. Only works on notes/attachments for safety.",
       {
         item_key: z.string().describe("Note or attachment key to trash"),
+        group_id: z.string().optional().describe("Group ID (from list_groups). Omit for personal library."),
       },
-      async ({ item_key }) => {
+      async ({ item_key, group_id }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await trashItem(apiKey, libraryId, item_key);
+        const result = await trashItem(apiKey, libraryId, item_key, group_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -535,7 +582,7 @@ export default {
     // Health check
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "zotero-assistant", version: "0.4.0", status: "ok" }),
+        JSON.stringify({ name: "zotero-assistant", version: "0.5.0", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }

@@ -1,7 +1,7 @@
 {
   "name": "Zotero Assistant",
   "description": "Zotero MCP server for searching and managing Zotero libraries",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "worker": {
     "name": "zotero-assistant-mcp",
     "durableObjectBinding": "MCP_OBJECT",
@@ -39,16 +39,6 @@
       "helpText": "Your Zotero user library ID (numeric ID from your account)",
       "helpUrl": "https://www.zotero.org/settings/keys",
       "placeholder": "12345678"
-    }
-  ],
-  "config": [
-    {
-      "key": "ZOTERO_LIBRARY_TYPE",
-      "label": "Library Type",
-      "type": "text",
-      "required": false,
-      "helpText": "Set to 'group' for shared/group libraries. Defaults to 'user'.",
-      "placeholder": "user"
     }
   ],
   "autoSecrets": ["BEARER_TOKEN"]
