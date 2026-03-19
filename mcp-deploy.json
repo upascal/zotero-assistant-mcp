@@ -18,7 +18,7 @@
       "required": true,
       "helpText": "Your Zotero API key for authentication",
       "helpUrl": "https://www.zotero.org/settings/keys",
-      "placeholder": "sk-...",
+      "placeholder": "Enter API key",
       "test": {
         "url": "https://api.zotero.org/users/{{ZOTERO_LIBRARY_ID}}/collections?limit=1",
         "method": "GET",
@@ -41,6 +41,15 @@
       "placeholder": "12345678"
     }
   ],
-  "config": [],
+  "config": [
+    {
+      "key": "ZOTERO_LIBRARY_TYPE",
+      "label": "Library Type",
+      "type": "text",
+      "required": false,
+      "helpText": "Set to 'group' for shared/group libraries. Defaults to 'user'.",
+      "placeholder": "user"
+    }
+  ],
   "autoSecrets": ["BEARER_TOKEN"]
 }

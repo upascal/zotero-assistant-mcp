@@ -10,6 +10,12 @@ import zoteroApiClient from "zotero-api-client";
 const api = (zoteroApiClient as any).default || zoteroApiClient;
 
 // -------------------------------------------------------------------------
+// Progress callback — lets callers (tool handlers) report step-by-step status
+// -------------------------------------------------------------------------
+
+export type ProgressCallback = (step: number, total: number, message: string) => void;
+
+// -------------------------------------------------------------------------
 // Item type mapping
 // -------------------------------------------------------------------------
 
@@ -33,6 +39,49 @@ const ITEM_TYPE_MAP: Record<string, string> = {
   podcast: "podcast",
   presentation: "presentation",
 };
+
+// -------------------------------------------------------------------------
+// Creator / author parsing
+// -------------------------------------------------------------------------
+
+const INSTITUTION_INDICATORS =
+  /\b(Inc\.?|LLC|Ltd\.?|Corp\.?|Association|Foundation|Institute|University|Organization|Organisation|Commission|Committee|Department|Ministry|Agency|Bureau|Council|Board|Authority|Center|Centre|Library|Museum|Society|Academy|Group|Team|Lab|Laboratory|Network|Consortium|Coalition|WHO|UNESCO|UNICEF|OECD|NATO|EU|UN|IMF|CDC|FDA|NIH|EPA|NSF|NIST|RAND|MIT|CERN)\b/i;
+
+const NAME_SUFFIXES = /^(Jr\.?|Sr\.?|III?|IV|V|VI|VII|VIII|Esq\.?|Ph\.?D\.?|M\.?D\.?|D\.?O\.?)$/i;
+
+function parseCreator(input: string, creatorType = "author") {
+  const name = input.trim();
+
+  // Single word or known institution pattern → single-field (institutional) creator
+  if (!name.includes(" ") || INSTITUTION_INDICATORS.test(name)) {
+    return { creatorType, name };
+  }
+
+  // "Last, First" format
+  if (name.includes(",")) {
+    const [last, ...rest] = name.split(",").map((s) => s.trim());
+    return { creatorType, firstName: rest.join(", "), lastName: last };
+  }
+
+  // Split on spaces, handle suffixes (e.g., "John Smith Jr.")
+  const parts = name.split(/\s+/);
+  let lastIdx = parts.length - 1;
+
+  // If last token is a suffix, include it with the lastName
+  if (lastIdx > 1 && NAME_SUFFIXES.test(parts[lastIdx])) {
+    return {
+      creatorType,
+      firstName: parts.slice(0, lastIdx - 1).join(" "),
+      lastName: parts.slice(lastIdx - 1).join(" "),
+    };
+  }
+
+  return {
+    creatorType,
+    firstName: parts.slice(0, lastIdx).join(" "),
+    lastName: parts[lastIdx],
+  };
+}
 
 // -------------------------------------------------------------------------
 // URL unwrapping
@@ -71,8 +120,14 @@ function unwrapUrl(raw: string): string {
 // Zotero client factory
 // -------------------------------------------------------------------------
 
+let _libraryType = "user";
+
+export function setLibraryType(type: string) {
+  _libraryType = type;
+}
+
 function zotClient(apiKey: string, libraryId: string) {
-  return api(apiKey).library("user", libraryId);
+  return api(apiKey).library(_libraryType, libraryId);
 }
 
 // -------------------------------------------------------------------------
@@ -210,13 +265,16 @@ interface CreateItemParams {
   collectionId?: string;
   pdfUrl?: string;
   snapshotUrl?: string;
+  fileBase64?: string;
+  fileName?: string;
   extra?: string;
 }
 
 export async function createItem(
   apiKey: string,
   libraryId: string,
-  params: CreateItemParams
+  params: CreateItemParams,
+  onProgress?: ProgressCallback
 ) {
   const {
     title,
@@ -234,6 +292,8 @@ export async function createItem(
     collectionId,
     pdfUrl,
     snapshotUrl,
+    fileBase64,
+    fileName,
     extra,
   } = params;
 
@@ -269,17 +329,7 @@ export async function createItem(
 
   // Authors
   if (authors.length > 0 && "creators" in template) {
-    template.creators = authors.map((name: string) => {
-      const parts = name.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        return {
-          creatorType: "author",
-          firstName: parts.slice(0, -1).join(" "),
-          lastName: parts[parts.length - 1],
-        };
-      }
-      return { creatorType: "author", name };
-    });
+    template.creators = authors.map((name: string) => parseCreator(name));
   }
 
   // Tags
@@ -293,6 +343,11 @@ export async function createItem(
   }
 
   // Create
+  const hasAttachment = !!(pdfUrl || snapshotUrl || (fileBase64 && fileName));
+  const totalSteps = hasAttachment ? 2 : 1;
+
+  onProgress?.(1, totalSteps, `Creating ${zoteroType}: "${title}"`);
+
   const zot = zotClient(apiKey, libraryId);
   try {
     const response = await zot.items().post([template]);
@@ -314,6 +369,7 @@ export async function createItem(
 
     // Attach PDF (takes priority)
     if (pdfUrl) {
+      onProgress?.(2, totalSteps, `Attaching PDF from URL`);
       result.pdf_attachment = await attachPdfFromUrl(
         apiKey,
         libraryId,
@@ -321,17 +377,144 @@ export async function createItem(
         pdfUrl
       );
     } else if (snapshotUrl) {
+      onProgress?.(2, totalSteps, `Attaching webpage snapshot`);
       result.snapshot_attachment = await attachSnapshot(
         apiKey,
         libraryId,
         itemKey,
         snapshotUrl
       );
+    } else if (fileBase64 && fileName) {
+      onProgress?.(2, totalSteps, `Attaching file: ${fileName}`);
+      result.file_attachment = await attachFile(
+        apiKey,
+        libraryId,
+        itemKey,
+        fileName,
+        fileBase64
+      );
     }
 
     return result;
   } catch (err: any) {
     return { success: false, error: err.message };
+  }
+}
+
+// -------------------------------------------------------------------------
+// MIME detection
+// -------------------------------------------------------------------------
+
+function detectContentType(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    pdf: "application/pdf",
+    html: "text/html",
+    htm: "text/html",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    svg: "image/svg+xml",
+    txt: "text/plain",
+    json: "application/json",
+    csv: "text/csv",
+    md: "text/markdown",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  };
+  return map[ext || ""] || "application/octet-stream";
+}
+
+// -------------------------------------------------------------------------
+// Attach file (base64)
+// -------------------------------------------------------------------------
+
+export async function attachFile(
+  apiKey: string,
+  libraryId: string,
+  parentItemKey: string,
+  filename: string,
+  contentBase64: string,
+  contentType?: string,
+  title?: string,
+  onProgress?: ProgressCallback
+) {
+  try {
+    const buffer = Buffer.from(contentBase64, "base64");
+
+    if (buffer.length === 0) {
+      return { success: false, error: "Decoded file content is empty (0 bytes)" };
+    }
+
+    const resolvedContentType = contentType || detectContentType(filename);
+    const resolvedTitle = title || filename;
+
+    onProgress?.(1, 2, `Creating attachment item: ${filename}`);
+    console.log(
+      `[attach_file] Attaching ${filename} (${buffer.length} bytes, ${resolvedContentType}) to ${parentItemKey}`
+    );
+
+    const zot = zotClient(apiKey, libraryId);
+    const attachmentTemplate = {
+      itemType: "attachment",
+      parentItem: parentItemKey,
+      linkMode: "imported_file",
+      title: resolvedTitle,
+      contentType: resolvedContentType,
+      filename,
+    };
+
+    const createResp = await zot.items().post([attachmentTemplate]);
+    const attachmentItem = createResp.getEntityByIndex(0);
+
+    if (!attachmentItem) {
+      const rawResp = JSON.stringify(createResp.raw || createResp);
+      return {
+        success: false,
+        error: `Failed to create attachment item. API response: ${rawResp}`,
+      };
+    }
+
+    console.log(
+      `[attach_file] Attachment item created: ${attachmentItem.key}. Uploading file content...`
+    );
+
+    onProgress?.(2, 2, `Uploading file (${(buffer.length / 1024).toFixed(0)} KB)`);
+
+    const uploadResp = await zot
+      .items(attachmentItem.key)
+      .attachment(filename, buffer, resolvedContentType)
+      .post();
+
+    const uploadStatus = uploadResp?.response?.status || uploadResp?.status;
+    const uploadOk = uploadResp?.response?.ok ?? uploadResp?.ok;
+    console.log(
+      `[attach_file] Upload response status: ${uploadStatus}, ok: ${uploadOk}`
+    );
+
+    if (uploadOk === false) {
+      const uploadBody = JSON.stringify(
+        uploadResp?.raw || uploadResp?.getData?.() || "unknown"
+      );
+      return {
+        success: false,
+        error: `Attachment item created (${attachmentItem.key}) but file upload failed. Status: ${uploadStatus}. Response: ${uploadBody}`,
+        attachment_key: attachmentItem.key,
+      };
+    }
+
+    console.log(
+      `[attach_file] Successfully attached ${filename} to ${parentItemKey}`
+    );
+    return {
+      success: true,
+      filename,
+      size_bytes: buffer.length,
+      attachment_key: attachmentItem.key,
+    };
+  } catch (err: any) {
+    console.log(`[attach_file] Error: ${err.message}\n${err.stack}`);
+    return { success: false, error: `Failed to attach file: ${err.message}` };
   }
 }
 
@@ -344,11 +527,13 @@ export async function attachPdfFromUrl(
   libraryId: string,
   parentItemKey: string,
   pdfUrl: string,
-  filename?: string
+  filename?: string,
+  onProgress?: ProgressCallback
 ) {
   pdfUrl = unwrapUrl(pdfUrl);
 
   try {
+    onProgress?.(1, 3, `Downloading PDF from URL`);
     console.log(`[attach_pdf] Fetching PDF from: ${pdfUrl}`);
     const response = await fetch(pdfUrl, {
       headers: {
@@ -398,6 +583,8 @@ export async function attachPdfFromUrl(
       `[attach_pdf] Creating attachment item: ${filename} (${buffer.length} bytes)`
     );
 
+    onProgress?.(2, 3, `Creating attachment item: ${filename}`);
+
     // Upload via Zotero API
     const zot = zotClient(apiKey, libraryId);
     const attachmentTemplate = {
@@ -423,6 +610,8 @@ export async function attachPdfFromUrl(
     console.log(
       `[attach_pdf] Attachment item created: ${attachmentItem.key}. Uploading file content...`
     );
+
+    onProgress?.(3, 3, `Uploading PDF (${(buffer.length / 1024).toFixed(0)} KB)`);
 
     const uploadResp = await zot
       .items(attachmentItem.key)
@@ -470,11 +659,13 @@ export async function attachSnapshot(
   libraryId: string,
   parentItemKey: string,
   url: string,
-  title?: string
+  title?: string,
+  onProgress?: ProgressCallback
 ) {
   url = unwrapUrl(url);
 
   try {
+    onProgress?.(1, 3, `Fetching webpage`);
     console.log(`[attach_snapshot] Fetching page: ${url}`);
     const response = await fetch(url, {
       headers: {
@@ -544,6 +735,7 @@ export async function attachSnapshot(
       filename,
     };
 
+    onProgress?.(2, 3, `Creating snapshot attachment: ${title}`);
     console.log(
       `[attach_snapshot] Creating attachment item: ${filename}`
     );
@@ -561,6 +753,8 @@ export async function attachSnapshot(
     console.log(
       `[attach_snapshot] Attachment item created: ${attachmentItem.key}. Uploading HTML content (${buffer.length} bytes)...`
     );
+
+    onProgress?.(3, 3, `Uploading snapshot (${(buffer.length / 1024).toFixed(0)} KB)`);
 
     const uploadResp = await zot
       .items(attachmentItem.key)
@@ -617,6 +811,8 @@ interface SearchParams {
   direction?: string;
   limit?: number;
   offset?: number;
+  dateFrom?: string;
+  dateTo?: string;
 }
 
 export async function searchItems(
@@ -634,17 +830,23 @@ export async function searchItems(
     direction = "desc",
     limit = 25,
     offset = 0,
+    dateFrom,
+    dateTo,
   } = params;
 
+  const hasDateFilter = dateFrom || dateTo;
   const zot = zotClient(apiKey, libraryId);
-  const reqParams: any = { sort, direction, limit, start: offset };
+
+  // When date filtering, we fetch more items and filter client-side
+  // since the Zotero API doesn't support date range params
+  const fetchLimit = hasDateFilter ? Math.min(limit * 3, 100) : limit;
+  const reqParams: any = { sort, direction, limit: fetchLimit, start: offset };
 
   if (query) {
     reqParams.q = query;
     reqParams.qmode = qmode;
   }
-  if (tag)
-    reqParams.tag = Array.isArray(tag) ? tag.join(" || ") : tag;
+  if (tag) reqParams.tag = tag;
   if (itemType) reqParams.itemType = resolveItemType(itemType);
 
   try {
@@ -661,23 +863,35 @@ export async function searchItems(
 
     const totalResults =
       response.response?.headers?.get("Total-Results") || null;
-    const items = (response.raw || [])
+    let items = (response.raw || [])
       .filter(
         (r: any) =>
           r.data?.itemType !== "attachment" && r.data?.itemType !== "note"
-      )
-      .map(formatItemSummary);
+      );
+
+    // Client-side date filtering (using dateAdded for consistency)
+    if (hasDateFilter) {
+      const from = dateFrom ? new Date(dateFrom).getTime() : 0;
+      const to = dateTo ? new Date(dateTo + "T23:59:59Z").getTime() : Infinity;
+      items = items.filter((r: any) => {
+        const itemDate = new Date(r.data?.dateAdded || r.data?.dateModified || 0).getTime();
+        return itemDate >= from && itemDate <= to;
+      });
+    }
+
+    const formatted = items.slice(0, limit).map(formatItemSummary);
 
     return {
-      items,
+      items: formatted,
       totalResults: totalResults
         ? parseInt(totalResults, 10)
-        : items.length,
+        : formatted.length,
       offset,
       limit,
+      ...(hasDateFilter && { date_filtered: true }),
     };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
   }
 }
 
@@ -703,14 +917,35 @@ export async function getItem(
       contentType: c.data?.contentType || null,
     }));
 
-    return {
+    // Curated fields — avoids dumping 30+ empty/rarely-useful Zotero fields
+    const curated: Record<string, any> = {
       key: raw.key,
       version: raw.version,
-      ...data,
-      children,
+      itemType: data.itemType,
+      title: data.title,
     };
+
+    // Only include non-empty optional fields
+    const optionalFields = [
+      "creators", "date", "url", "doi", "abstractNote",
+      "publicationTitle", "volume", "issue", "pages",
+      "tags", "collections", "extra", "publisher",
+      "bookTitle", "proceedingsTitle", "conferenceName",
+      "university", "institution", "place",
+    ];
+    for (const field of optionalFields) {
+      const val = data[field];
+      if (val !== undefined && val !== null && val !== "" &&
+          !(Array.isArray(val) && val.length === 0)) {
+        curated[field] = val;
+      }
+    }
+
+    curated.children = children;
+
+    return curated;
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
   }
 }
 
@@ -765,7 +1000,129 @@ export async function getItemFulltext(
       message: "No full-text content available for this item.",
     };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
+  }
+}
+
+// -------------------------------------------------------------------------
+// Read attachment (unified — auto-detects type and uses correct method)
+// -------------------------------------------------------------------------
+
+export async function readAttachment(
+  apiKey: string,
+  libraryId: string,
+  itemKey: string,
+  onProgress?: ProgressCallback
+) {
+  const zot = zotClient(apiKey, libraryId);
+  try {
+    onProgress?.(1, 2, `Fetching item metadata`);
+    const itemResp = await zot.items(itemKey).get();
+    const raw = itemResp.raw;
+    const data = raw.data || raw;
+
+    // If this is a parent item, find its attachments and read the best one
+    if (data.itemType !== "attachment" && data.itemType !== "note") {
+      onProgress?.(2, 2, `Searching attachments for readable content`);
+      const childrenResp = await zot.items(itemKey).children().get();
+      const attachments = (childrenResp.raw || []).filter(
+        (c: any) => c.data?.itemType === "attachment" && c.data?.contentType
+      );
+
+      if (attachments.length === 0) {
+        return {
+          success: false,
+          error: `Item '${data.title || itemKey}' has no attachments.`,
+          item_key: itemKey,
+        };
+      }
+
+      // Try each attachment — prefer text-based, then fulltext from PDFs
+      for (const att of attachments) {
+        const ct = att.data?.contentType || "";
+        if (ct.includes("html") || ct.includes("text") || ct.includes("xml") || ct.includes("json") || ct.includes("markdown")) {
+          const result = await getAttachmentContent(apiKey, libraryId, att.key);
+          if (result.content) return { ...result, parent_item_key: itemKey };
+        }
+      }
+
+      // Fall back to fulltext (PDF extraction)
+      for (const att of attachments) {
+        try {
+          const ftResp = await zot.items(att.key).fulltext().get();
+          const ftData = ftResp.getData?.() || ftResp.raw;
+          if (ftData?.content) {
+            return {
+              item_key: itemKey,
+              attachment_key: att.key,
+              filename: att.data?.filename || att.data?.title || null,
+              contentType: att.data?.contentType || null,
+              content: ftData.content,
+              source: "fulltext_extraction",
+            };
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      // Nothing readable — list what's available
+      const available = attachments.map((a: any) => ({
+        key: a.key,
+        title: a.data?.title || a.data?.filename || null,
+        contentType: a.data?.contentType || null,
+      }));
+      return {
+        success: false,
+        error: "No readable content found. PDF may not be indexed yet — Zotero needs to sync and process it first.",
+        item_key: itemKey,
+        attachments: available,
+      };
+    }
+
+    // If this IS an attachment, read it directly
+    if (data.itemType === "attachment") {
+      onProgress?.(2, 2, `Reading attachment content`);
+      const ct = data.contentType || "";
+
+      // Text-based: download and return content
+      if (ct.includes("html") || ct.includes("text") || ct.includes("xml") || ct.includes("json") || ct.includes("markdown")) {
+        return await getAttachmentContent(apiKey, libraryId, itemKey);
+      }
+
+      // Binary (PDF etc): try fulltext extraction
+      try {
+        const ftResp = await zot.items(itemKey).fulltext().get();
+        const ftData = ftResp.getData?.() || ftResp.raw;
+        if (ftData?.content) {
+          return {
+            item_key: itemKey,
+            filename: data.filename || data.title || null,
+            contentType: ct,
+            content: ftData.content,
+            source: "fulltext_extraction",
+          };
+        }
+      } catch {
+        // No fulltext available
+      }
+
+      return {
+        success: false,
+        error: `Attachment '${data.filename || data.title || itemKey}' is binary (${ct}) and has no extracted text yet. Zotero needs to sync and index it first.`,
+        item_key: itemKey,
+        filename: data.filename || data.title || null,
+        contentType: ct,
+      };
+    }
+
+    // It's a note — redirect
+    return {
+      success: false,
+      error: `Item ${itemKey} is a note, not an attachment. Use get_note to read note content.`,
+    };
+  } catch (err: any) {
+    return { success: false, error: `Failed to read attachment: ${err.message}` };
   }
 }
 
@@ -806,7 +1163,7 @@ export async function getCollectionItems(
       limit,
     };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
   }
 }
 
@@ -824,7 +1181,7 @@ export async function listTags(
     }));
     return { tags, offset, limit };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
   }
 }
 
@@ -847,7 +1204,7 @@ export async function getRecentItems(
       .map(formatItemSummary);
     return { items };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
   }
 }
 
@@ -887,6 +1244,55 @@ export async function createNote(
 }
 
 // -------------------------------------------------------------------------
+// Get note content
+// -------------------------------------------------------------------------
+
+export async function getNoteContent(
+  apiKey: string,
+  libraryId: string,
+  itemKey: string
+) {
+  const zot = zotClient(apiKey, libraryId);
+  try {
+    const itemResp = await zot.items(itemKey).get();
+    const raw = itemResp.raw;
+    const data = raw.data || raw;
+
+    if (data.itemType === "note") {
+      return {
+        item_key: raw.key,
+        title: data.title || null,
+        note: data.note || "",
+        tags: (data.tags || []).map((t: any) => t.tag || t),
+        parent_item: data.parentItem || null,
+      };
+    }
+
+    // If it's a parent item, find child notes
+    if (data.itemType !== "note") {
+      const childrenResp = await zot.items(itemKey).children().get();
+      const notes = (childrenResp.raw || [])
+        .filter((c: any) => c.data?.itemType === "note")
+        .map((c: any) => ({
+          item_key: c.key,
+          title: c.data?.title || null,
+          note: c.data?.note || "",
+          tags: (c.data?.tags || []).map((t: any) => t.tag || t),
+        }));
+
+      if (notes.length === 0) {
+        return { success: false, error: `Item ${itemKey} has no notes.` };
+      }
+      return { parent_item_key: itemKey, notes };
+    }
+
+    return { success: false, error: `Item ${itemKey} is not a note (type: ${data.itemType}).` };
+  } catch (err: any) {
+    return { success: false, error: `Failed to get note: ${err.message}` };
+  }
+}
+
+// -------------------------------------------------------------------------
 // Get attachment content
 // -------------------------------------------------------------------------
 
@@ -903,6 +1309,7 @@ export async function getAttachmentContent(
 
     if (data.itemType !== "attachment") {
       return {
+        success: false,
         error: `Item ${itemKey} is not an attachment (type: ${data.itemType}). Use get_item to find child attachment keys.`,
       };
     }
@@ -911,8 +1318,9 @@ export async function getAttachmentContent(
     const filename = data.filename || data.title || "unknown";
 
     // Download the file content
+    const libPrefix = _libraryType === "group" ? "groups" : "users";
     const fileResp = await fetch(
-      `https://api.zotero.org/users/${libraryId}/items/${itemKey}/file`,
+      `https://api.zotero.org/${libPrefix}/${libraryId}/items/${itemKey}/file`,
       {
         headers: { "Zotero-API-Key": apiKey },
         signal: AbortSignal.timeout(60000),
@@ -921,6 +1329,7 @@ export async function getAttachmentContent(
 
     if (!fileResp.ok) {
       return {
+        success: false,
         error: `Failed to download attachment: HTTP ${fileResp.status} ${fileResp.statusText}`,
         item_key: itemKey,
         filename,
@@ -956,7 +1365,7 @@ export async function getAttachmentContent(
       message: `Binary file (${contentType}). Use get_item_fulltext to retrieve extracted text content if available.`,
     };
   } catch (err: any) {
-    return { error: `Failed to get attachment content: ${err.message}` };
+    return { success: false, error: `Failed to get attachment content: ${err.message}` };
   }
 }
 
@@ -970,16 +1379,20 @@ export async function getLibraryStats(
 ) {
   const zot = zotClient(apiKey, libraryId);
   try {
-    // Run three queries in parallel for efficiency
-    const [itemsResp, collectionsResult, tagsResult] = await Promise.all([
-      // Get total item count with limit=0 (just headers)
+    // Run queries in parallel for efficiency
+    const [itemsResp, collectionsResult, tagsResp] = await Promise.all([
       zot.items().top().get({ limit: 1, sort: "dateModified", direction: "desc" }),
       listCollections(apiKey, libraryId),
-      listTags(apiKey, libraryId, { limit: 25, offset: 0 }),
+      zot.tags().get({ limit: 100, sort: "numItems", direction: "desc" }),
     ]);
 
     const totalItems = parseInt(
       itemsResp.response?.headers?.get("Total-Results") || "0",
+      10
+    );
+
+    const totalTags = parseInt(
+      tagsResp.response?.headers?.get("Total-Results") || "0",
       10
     );
 
@@ -992,15 +1405,16 @@ export async function getLibraryStats(
         }
       : null;
 
-    // Sort tags by count
-    const topTags = (tagsResult.tags || [])
+    // Top tags sorted by usage count
+    const topTags = (tagsResp.raw || [])
+      .map((t: any) => ({ tag: t.tag, numItems: t.meta?.numItems || 0 }))
       .sort((a: any, b: any) => b.numItems - a.numItems)
-      .slice(0, 15);
+      .slice(0, 20);
 
     return {
       total_items: totalItems,
       total_collections: collectionsResult.length,
-      total_tags: topTags.length,
+      total_tags: totalTags,
       collections: collectionsResult.map((c: any) => ({
         key: c.key,
         name: c.name,
@@ -1009,7 +1423,44 @@ export async function getLibraryStats(
       last_modified_item: lastModified,
     };
   } catch (err: any) {
-    return { error: err.message };
+    return { success: false, error: err.message };
+  }
+}
+
+// -------------------------------------------------------------------------
+// Trash item (notes and attachments only)
+// -------------------------------------------------------------------------
+
+export async function trashItem(
+  apiKey: string,
+  libraryId: string,
+  itemKey: string
+) {
+  const zot = zotClient(apiKey, libraryId);
+  try {
+    // First verify this is a note or attachment (safety check)
+    const itemResp = await zot.items(itemKey).get();
+    const raw = itemResp.raw;
+    const data = raw.data || raw;
+    const version = raw.version;
+
+    if (data.itemType !== "note" && data.itemType !== "attachment") {
+      return {
+        success: false,
+        error: `Cannot trash item of type '${data.itemType}'. Only notes and attachments can be trashed through this tool.`,
+      };
+    }
+
+    await zot.items(itemKey).version(version).patch({ deleted: 1 });
+
+    return {
+      success: true,
+      item_key: itemKey,
+      item_type: data.itemType,
+      message: `Moved ${data.itemType} '${data.title || data.note?.slice(0, 50) || itemKey}' to trash`,
+    };
+  } catch (err: any) {
+    return { success: false, error: `Failed to trash item: ${err.message}` };
   }
 }
 
@@ -1021,6 +1472,13 @@ interface UpdateChanges {
   title?: string;
   abstract?: string;
   date?: string;
+  url?: string;
+  doi?: string;
+  publication?: string;
+  volume?: string;
+  issue?: string;
+  pages?: string;
+  creators?: Array<{ firstName?: string; lastName?: string; name?: string; creatorType?: string }>;
   extra?: string;
   tags?: string[];
   add_tags?: string[];
@@ -1049,7 +1507,34 @@ export async function updateItem(
     if (changes.title !== undefined) patch.title = changes.title;
     if (changes.abstract !== undefined) patch.abstractNote = changes.abstract;
     if (changes.date !== undefined) patch.date = changes.date;
+    if (changes.url !== undefined) patch.url = changes.url;
+    if (changes.doi !== undefined) patch.DOI = changes.doi;
     if (changes.extra !== undefined) patch.extra = changes.extra;
+
+    // Publication title — different field name per item type
+    if (changes.publication !== undefined) {
+      if ("publicationTitle" in currentData) patch.publicationTitle = changes.publication;
+      else if ("blogTitle" in currentData) patch.blogTitle = changes.publication;
+      else if ("websiteTitle" in currentData) patch.websiteTitle = changes.publication;
+      else patch.publicationTitle = changes.publication;
+    }
+    if (changes.volume !== undefined) patch.volume = changes.volume;
+    if (changes.issue !== undefined) patch.issue = changes.issue;
+    if (changes.pages !== undefined) patch.pages = changes.pages;
+
+    // Creators
+    if (changes.creators !== undefined) {
+      patch.creators = changes.creators.map((c) => {
+        if (c.name) {
+          return { creatorType: c.creatorType || "author", name: c.name };
+        }
+        return {
+          creatorType: c.creatorType || "author",
+          firstName: c.firstName || "",
+          lastName: c.lastName || "",
+        };
+      });
+    }
 
     // Tag handling: replace, add, or remove
     if (changes.tags !== undefined) {

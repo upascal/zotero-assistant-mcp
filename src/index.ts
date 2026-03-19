@@ -35,23 +35,75 @@ globalThis.fetch = function patchedFetch(
 };
 
 import {
-  getItemTypes,
   listCollections,
   createItem,
   attachPdfFromUrl,
+  attachFile,
   attachSnapshot,
   searchItems,
   getItem,
-  getItemFulltext,
   getCollectionItems,
   listTags,
-  getRecentItems,
   createNote,
   updateItem,
   createCollection,
-  getAttachmentContent,
   getLibraryStats,
+  getNoteContent,
+  readAttachment,
+  setLibraryType,
+  trashItem,
+  type ProgressCallback,
 } from "./zotero.js";
+
+// -------------------------------------------------------------------------
+// Progress notification helper — bridges ProgressCallback to MCP protocol
+// -------------------------------------------------------------------------
+
+function makeProgressReporter(extra: any): ProgressCallback {
+  const progressToken = extra?._meta?.progressToken;
+  return (step: number, total: number, message: string) => {
+    extra.sendNotification?.({
+      method: "notifications/progress" as const,
+      params: {
+        progressToken: progressToken ?? "progress",
+        progress: step,
+        total,
+        message,
+      },
+    });
+  };
+}
+
+// -------------------------------------------------------------------------
+// Server instructions — injected once at init, not per-tool
+// -------------------------------------------------------------------------
+
+const SERVER_INSTRUCTIONS = `Zotero library management server. Manages items, attachments, notes, tags, and collections.
+
+SAVING WORKFLOW:
+1. Fetch the URL content using your built-in tools
+2. Extract metadata: title, authors, date, abstract, DOI, publication
+3. Generate 2-5 descriptive tags
+4. Call list_collections to find the right collection
+5. Call save_item with metadata + attachment (pdf_url, snapshot_url, or file_base64/file_name)
+
+READING ATTACHMENTS:
+- Use read_attachment with any item key (parent or attachment) — it auto-detects type and extracts content
+- For notes, use get_note
+
+ITEM TYPES: article, book, chapter, conference, thesis, report, webpage, blog, news, magazine, document, legal, case, patent, video, podcast, presentation
+
+SEARCH TIPS:
+- Tag arrays use AND logic: tag: ['AI', 'ethics'] matches items with ALL tags
+- Prefix with - to exclude: tag: '-reviewed'
+- date_from/date_to filter by dateAdded (YYYY-MM-DD)
+- sort=dateAdded&direction=desc for recent items
+
+AUTHORS: Can be personal names ("Jane Smith") or organizations ("WHO", "World Health Organization"). Suffixes like "Jr." and "III" are handled automatically.
+
+UPDATING: update_item accepts any combination of: title, url, doi, publication, volume, issue, pages, creators, abstract, date, extra, and tag/collection operations (add_tags, remove_tags, tags, add_collections, remove_collections, collections).
+
+CREATORS FORMAT: Use firstName/lastName for people, name for institutions. creatorType defaults to "author" (also: editor, translator, contributor).`;
 
 // -------------------------------------------------------------------------
 // McpAgent — Durable Object that serves the MCP protocol
@@ -60,10 +112,15 @@ import {
 export class ZoteroMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "zotero-assistant",
-    version: "0.2.0",
+    version: "0.4.0",
+    instructions: SERVER_INSTRUCTIONS,
   });
 
   async init() {
+    // Configure library type (user or group)
+    const libraryType = (this.env as any).ZOTERO_LIBRARY_TYPE || "user";
+    setLibraryType(libraryType);
+
     const getCredentials = () => {
       const apiKey = this.env.ZOTERO_API_KEY;
       const libraryId = this.env.ZOTERO_LIBRARY_ID;
@@ -77,242 +134,30 @@ export class ZoteroMCP extends McpAgent<Env> {
     };
 
     // =====================================================================
-    // Utility Tools
-    // =====================================================================
-
-    this.server.tool(
-      "get_help",
-      "Get workflow instructions for using Zotero tools. Call with no topic for an overview, or with a topic for detailed guidance. Topics: search, saving, attachments, updating, collections.",
-      {
-        topic: z
-          .string()
-          .optional()
-          .describe("Help topic: search, saving, attachments, updating, collections. Omit for overview."),
-      },
-      async (params) => {
-        const topics: Record<string, any> = {
-          overview: {
-            available_topics: [
-              "search — Search syntax, qmode, tag filters, sorting",
-              "saving — Workflow for saving URLs, metadata extraction, item types",
-              "attachments — Snapshots vs PDFs, reading attachment content back",
-              "updating — Editing metadata, tags, moving between collections",
-              "collections — Creating, listing, organizing collections",
-            ],
-            available_tools: {
-              search_and_browse: [
-                "search_items — Search by text, tags, type, or collection",
-                "get_collection_items — List items in a collection",
-                "get_recent_items — Recently added/modified items",
-                "list_collections — All collections (folders)",
-                "create_collection — Create a new collection",
-                "list_tags — All tags in library",
-                "get_library_stats — Library overview with counts and top tags",
-              ],
-              read: [
-                "get_item — Full metadata + children summary",
-                "get_item_fulltext — Extracted text from PDFs",
-                "get_attachment_content — Read snapshot HTML or attachment files",
-              ],
-              write: [
-                "save_item — Create new item with metadata + attachments",
-                "attach_pdf — Attach PDF to existing item",
-                "attach_snapshot — Attach webpage snapshot to existing item",
-                "create_note — Create note on existing item",
-                "update_item — Modify metadata, tags, and collections",
-              ],
-            },
-            quick_tips: [
-              "Always include 2-5 descriptive tags when saving",
-              "Use get_library_stats for a quick overview instead of broad searches",
-              "Use get_attachment_content (not get_item_fulltext) to read saved snapshots",
-            ],
-          },
-
-          search: {
-            description: "How to search the Zotero library effectively",
-            qmode: {
-              titleCreatorYear: "Default. Searches titles, creators, and year. Best for most queries.",
-              everything: "Also searches fulltext content. Use when title/creator search returns nothing.",
-            },
-            tag_filters: {
-              single_tag: "tag: 'AI' — items with this tag",
-              multiple_tags_AND: "tag: ['AI', 'ethics'] — items with ALL these tags",
-              exclude_tag: "tag: '-reviewed' — items WITHOUT this tag (prefix with -)",
-            },
-            item_type_filters: {
-              include: "item_type: 'article' — only journal articles",
-              exclude: "item_type: '-attachment' — exclude attachments (done automatically)",
-            },
-            tips: [
-              "Combine query + tag + collection_id for precise results",
-              "Use sort: 'dateAdded' to see newest additions first",
-              "Use qmode: 'everything' only when basic search misses results — it's slower",
-              "The default search covers title + creator + year, which handles most lookups",
-            ],
-          },
-
-          saving: {
-            description: "How to save items to the Zotero library",
-            workflow: [
-              "1. Fetch the URL content using your built-in web fetch tools",
-              "2. Extract metadata: title, authors, date, abstract, tags",
-              "3. Call list_collections to find the right folder (ask user if ambiguous)",
-              "4. Call save_item with metadata + snapshot_url (webpages) or pdf_url (PDFs)",
-            ],
-            metadata_tips: [
-              "Authors can be organizations: 'World Health Organization'",
-              "Write an abstract if the source lacks one — summarize in 2-3 sentences",
-              "For journal articles: extract DOI, volume, issue, pages if available",
-              "The item_type defaults to 'webpage' — use 'article' for journal papers, 'report' for think tank docs",
-            ],
-            common_types: "article, book, chapter, conference, thesis, report, webpage, blog, news",
-          },
-
-          attachments: {
-            description: "Working with PDFs, snapshots, and file attachments",
-            saving_attachments: {
-              pdf: "Include pdf_url in save_item, or use attach_pdf on an existing item",
-              snapshot: "Include snapshot_url in save_item, or use attach_snapshot on an existing item",
-            },
-            reading_attachments: {
-              html_snapshots: "Use get_attachment_content with the attachment's item key (from get_item children). Returns the full HTML.",
-              pdf_text: "Use get_item_fulltext to get extracted text from PDFs. Only works if Zotero has indexed the PDF.",
-              binary_files: "get_attachment_content returns metadata for binary files. Use get_item_fulltext for text extraction.",
-            },
-            tips: [
-              "get_item returns a 'children' array listing all attachments with their keys and content types",
-              "Use get_attachment_content for HTML snapshots — get_item_fulltext won't work for those",
-              "Don't call get_item just to verify a save — trust the success response",
-            ],
-          },
-
-          updating: {
-            description: "How to modify existing items",
-            tag_operations: {
-              add: "add_tags: ['new_tag'] — adds without removing existing tags",
-              remove: "remove_tags: ['old_tag'] — removes specific tags, keeps the rest",
-              replace: "tags: ['tag1', 'tag2'] — replaces ALL tags with this list",
-            },
-            collection_operations: {
-              add: "add_collections: ['COLLECTION_KEY'] — add to a collection without removing from others",
-              remove: "remove_collections: ['COLLECTION_KEY'] — remove from a collection, keep others",
-              replace: "collections: ['KEY1', 'KEY2'] — replace ALL collection memberships",
-            },
-            other_fields: "title, abstract, date, extra — pass any of these to update_item",
-          },
-
-          collections: {
-            description: "Working with collections (folders)",
-            operations: [
-              "list_collections — see all collections with keys",
-              "create_collection — create new, optionally nested under a parent",
-              "update_item with add_collections/remove_collections — move items between collections",
-            ],
-            tips: [
-              "Items can belong to multiple collections simultaneously",
-              "Use get_collection_items to browse a specific collection",
-              "Use collection_id in search_items to search within a collection",
-            ],
-          },
-        };
-
-        const topic = params.topic?.toLowerCase() || "overview";
-        const content = topics[topic] || {
-          error: `Unknown topic '${topic}'. Available: search, saving, attachments, updating, collections`,
-        };
-
-        return {
-          content: [{ type: "text", text: JSON.stringify(content, null, 2) }],
-        };
-      }
-    );
-
-    this.server.tool(
-      "prepare_url",
-      "Get instructions for fetching a URL's content before saving to Zotero. This tool does NOT fetch the content itself.",
-      { url: z.string().url().describe("The URL you want to fetch content from") },
-      async ({ url }) => {
-        const isPdf = /\.pdf$/i.test(url) || /\/pdf\//i.test(url);
-
-        const result = {
-          url,
-          is_pdf: isPdf,
-          instructions: isPdf
-            ? "This appears to be a PDF. When you call save_item, " +
-              "include this URL as the pdf_url parameter to attach it."
-            : "DO NOT open a browser tab for this URL. " +
-              "Use your built-in web_fetch or read_url tool to get the content. " +
-              "Then extract the metadata and call save_item.",
-          next_steps: [
-            `1. Fetch content from ${url} using your internal tools`,
-            "2. Extract: title, authors, date, abstract, tags",
-            "3. Call list_collections to find the right folder",
-            `4. Call save_item with all metadata and ${isPdf ? `pdf_url='${url}'` : `snapshot_url='${url}'`}`,
-          ],
-        };
-
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-    );
-
-    this.server.tool(
-      "get_item_types",
-      "Get list of supported item types for save_item.",
-      async () => {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(getItemTypes(), null, 2) },
-          ],
-        };
-      }
-    );
-
-    // =====================================================================
-    // Search & Browse Tools
+    // Search & Browse
     // =====================================================================
 
     this.server.tool(
       "search_items",
-      "Search the Zotero library by text query, tags, item type, or collection. Returns summaries with keys, titles, creators, dates, and tags.",
+      "Search the Zotero library by text, tags, type, collection, or date range.",
       {
-        query: z
-          .string()
-          .optional()
-          .describe("Free text search (default: titles + creators + year)"),
+        query: z.string().optional().describe("Free text search"),
         qmode: z
           .enum(["titleCreatorYear", "everything"])
           .default("titleCreatorYear")
-          .describe("Search mode: titleCreatorYear (default) or everything (includes fulltext)"),
+          .describe("Search scope"),
         tag: z
           .union([z.string(), z.array(z.string())])
           .optional()
-          .describe("Filter by tag. Prefix with - to exclude (e.g. '-reviewed'). Array for AND logic."),
-        item_type: z
-          .string()
-          .optional()
-          .describe('Filter by item type (e.g. "article", "book")'),
-        collection_id: z
-          .string()
-          .optional()
-          .describe("Limit to a specific collection"),
-        sort: z
-          .string()
-          .default("dateModified")
-          .describe("Sort field (default: dateModified)"),
-        direction: z
-          .enum(["asc", "desc"])
-          .default("desc")
-          .describe("Sort direction"),
-        limit: z
-          .number()
-          .min(1)
-          .max(100)
-          .default(25)
-          .describe("Max results (1-100)"),
+          .describe("Tag filter (array = AND, prefix - to exclude)"),
+        item_type: z.string().optional().describe("Item type filter"),
+        collection_id: z.string().optional().describe("Collection filter"),
+        sort: z.string().default("dateModified").describe("Sort field"),
+        direction: z.enum(["asc", "desc"]).default("desc").describe("Sort direction"),
+        limit: z.number().min(1).max(100).default(25).describe("Max results"),
         offset: z.number().min(0).default(0).describe("Pagination offset"),
+        date_from: z.string().optional().describe("Items added on/after (YYYY-MM-DD)"),
+        date_to: z.string().optional().describe("Items added on/before (YYYY-MM-DD)"),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -326,6 +171,8 @@ export class ZoteroMCP extends McpAgent<Env> {
           direction: params.direction,
           limit: params.limit,
           offset: params.offset,
+          dateFrom: params.date_from,
+          dateTo: params.date_to,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -335,22 +182,12 @@ export class ZoteroMCP extends McpAgent<Env> {
 
     this.server.tool(
       "get_collection_items",
-      "List items in a specific Zotero collection.",
+      "List items in a specific collection.",
       {
-        collection_id: z
-          .string()
-          .describe("Collection key from list_collections"),
+        collection_id: z.string().describe("Collection key"),
         sort: z.string().default("dateModified").describe("Sort field"),
-        direction: z
-          .enum(["asc", "desc"])
-          .default("desc")
-          .describe("Sort direction"),
-        limit: z
-          .number()
-          .min(1)
-          .max(100)
-          .default(25)
-          .describe("Max results"),
+        direction: z.enum(["asc", "desc"]).default("desc").describe("Sort direction"),
+        limit: z.number().min(1).max(100).default(25).describe("Max results"),
         offset: z.number().min(0).default(0).describe("Pagination offset"),
       },
       async (params) => {
@@ -373,35 +210,8 @@ export class ZoteroMCP extends McpAgent<Env> {
     );
 
     this.server.tool(
-      "get_recent_items",
-      "Get recently added or modified items from the Zotero library.",
-      {
-        limit: z
-          .number()
-          .min(1)
-          .max(50)
-          .default(10)
-          .describe("Max results (1-50)"),
-        sort: z
-          .enum(["dateAdded", "dateModified"])
-          .default("dateAdded")
-          .describe("Sort by dateAdded or dateModified"),
-      },
-      async (params) => {
-        const { apiKey, libraryId } = getCredentials();
-        const result = await getRecentItems(apiKey, libraryId, {
-          limit: params.limit,
-          sort: params.sort,
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-    );
-
-    this.server.tool(
       "list_collections",
-      "List all collections (folders) in the Zotero library. Call this before save_item to find the right collection_id.",
+      "List all collections (folders) in the library.",
       async () => {
         const { apiKey, libraryId } = getCredentials();
         try {
@@ -414,7 +224,7 @@ export class ZoteroMCP extends McpAgent<Env> {
         } catch (err: any) {
           return {
             content: [
-              { type: "text", text: JSON.stringify({ error: err.message }) },
+              { type: "text", text: JSON.stringify({ success: false, error: err.message }) },
             ],
           };
         }
@@ -423,32 +233,14 @@ export class ZoteroMCP extends McpAgent<Env> {
 
     this.server.tool(
       "create_collection",
-      "Create a new collection (folder) in the Zotero library. Optionally nest it under an existing collection by providing a parent ID.",
+      "Create a new collection, optionally nested under a parent.",
       {
-        name: z.string().describe("Name for the new collection"),
-        parent_collection_id: z
-          .string()
-          .optional()
-          .describe(
-            "Parent collection key to nest under (from list_collections). Omit for top-level."
-          ),
+        name: z.string().describe("Collection name"),
+        parent_collection_id: z.string().optional().describe("Parent collection key for nesting"),
       },
       async ({ name, parent_collection_id }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await createCollection(
-          apiKey,
-          libraryId,
-          name,
-          parent_collection_id
-        );
-
-        if (result.success) {
-          (result as any).nextSteps = [
-            `Use collection_id '${result.collection_key}' when calling save_item`,
-            "Use list_collections to verify it appears",
-          ];
-        }
-
+        const result = await createCollection(apiKey, libraryId, name, parent_collection_id);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -457,14 +249,9 @@ export class ZoteroMCP extends McpAgent<Env> {
 
     this.server.tool(
       "list_tags",
-      "List all tags in the Zotero library. Useful for discovering existing tags before filtering.",
+      "List tags in the library with item counts.",
       {
-        limit: z
-          .number()
-          .min(1)
-          .max(500)
-          .default(100)
-          .describe("Max tags to return"),
+        limit: z.number().min(1).max(500).default(100).describe("Max tags"),
         offset: z.number().min(0).default(0).describe("Pagination offset"),
       },
       async (params) => {
@@ -479,15 +266,27 @@ export class ZoteroMCP extends McpAgent<Env> {
       }
     );
 
+    this.server.tool(
+      "get_library_stats",
+      "Library overview: total items, collections, top tags, and last modified item.",
+      async () => {
+        const { apiKey, libraryId } = getCredentials();
+        const result = await getLibraryStats(apiKey, libraryId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
+
     // =====================================================================
-    // Read Tools
+    // Read
     // =====================================================================
 
     this.server.tool(
       "get_item",
-      "Get full metadata for a single Zotero item by its key, including a summary of child attachments and notes.",
+      "Get full metadata and children for a single item.",
       {
-        item_key: z.string().describe("The Zotero item key"),
+        item_key: z.string().describe("Zotero item key"),
       },
       async ({ item_key }) => {
         const { apiKey, libraryId } = getCredentials();
@@ -499,16 +298,30 @@ export class ZoteroMCP extends McpAgent<Env> {
     );
 
     this.server.tool(
-      "get_item_fulltext",
-      "Get the full-text content of a Zotero item (extracted text from PDFs, notes, etc.). Works on parent items by checking child attachments.",
+      "read_attachment",
+      "Read attachment content. Accepts parent item key or attachment key — auto-detects type and extracts content.",
       {
-        item_key: z
-          .string()
-          .describe("The Zotero item key (parent or attachment)"),
+        item_key: z.string().describe("Parent item key or attachment key"),
+      },
+      async ({ item_key }, extra) => {
+        const { apiKey, libraryId } = getCredentials();
+        const onProgress = makeProgressReporter(extra);
+        const result = await readAttachment(apiKey, libraryId, item_key, onProgress);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
+
+    this.server.tool(
+      "get_note",
+      "Read note content. Pass a note key for one note, or a parent item key for all child notes.",
+      {
+        item_key: z.string().describe("Note or parent item key"),
       },
       async ({ item_key }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await getItemFulltext(apiKey, libraryId, item_key);
+        const result = await getNoteContent(apiKey, libraryId, item_key);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -516,68 +329,35 @@ export class ZoteroMCP extends McpAgent<Env> {
     );
 
     // =====================================================================
-    // Write Tools
+    // Write
     // =====================================================================
 
     this.server.tool(
       "save_item",
-      "Create a new item in your Zotero library. " +
-        "WORKFLOW: 1) Fetch and read source content thoroughly. " +
-        "2) Extract ALL metadata: title, authors, date, abstract, publisher. " +
-        "3) Generate 2-5 descriptive tags. 4) Call list_collections for the right folder. " +
-        "5) If confident -> proceed. If uncertain -> ask user first. " +
-        "ATTACHMENTS: Include pdf_url for PDFs, snapshot_url for webpages.",
+      "Create a new item in the Zotero library with metadata and optional attachment.",
       {
-        title: z.string().describe("Item title (required)"),
-        item_type: z
-          .string()
-          .default("webpage")
-          .describe(
-            "Type: article, journal, book, chapter, conference, thesis, report, " +
-              "webpage, blog, news, magazine, document, legal, case, patent, video, podcast, presentation"
-          ),
-        authors: z
-          .array(z.string())
-          .optional()
-          .describe('Author names — can be organizations like "WHO"'),
-        date: z
-          .string()
-          .optional()
-          .describe('Publication date, e.g. "2025-07-25" or "July 2025"'),
-        url: z.string().optional().describe("URL of the item"),
-        abstract: z
-          .string()
-          .optional()
-          .describe("Abstract or summary — write one if missing"),
-        publication: z
-          .string()
-          .optional()
-          .describe("Journal/publication/website name"),
-        volume: z.string().optional().describe("Volume number"),
-        issue: z.string().optional().describe("Issue number"),
-        pages: z.string().optional().describe("Page range"),
-        doi: z.string().optional().describe("DOI identifier"),
-        tags: z.array(z.string()).optional().describe("2-5 descriptive tags"),
-        collection_id: z
-          .string()
-          .optional()
-          .describe("Collection ID from list_collections"),
-        pdf_url: z
-          .string()
-          .optional()
-          .describe("URL to download PDF attachment from"),
-        snapshot_url: z
-          .string()
-          .optional()
-          .describe("URL to save as HTML snapshot"),
-        extra: z
-          .string()
-          .optional()
-          .describe("Additional notes for the Extra field"),
+        title: z.string().describe("Item title"),
+        item_type: z.string().default("webpage").describe("Item type"),
+        authors: z.array(z.string()).optional().describe("Author names"),
+        date: z.string().optional().describe("Publication date"),
+        url: z.string().optional().describe("URL"),
+        abstract: z.string().optional().describe("Abstract or summary"),
+        publication: z.string().optional().describe("Journal/publication name"),
+        volume: z.string().optional().describe("Volume"),
+        issue: z.string().optional().describe("Issue"),
+        pages: z.string().optional().describe("Pages"),
+        doi: z.string().optional().describe("DOI"),
+        tags: z.array(z.string()).optional().describe("Tags"),
+        collection_id: z.string().optional().describe("Collection ID"),
+        pdf_url: z.string().optional().describe("PDF URL to attach"),
+        snapshot_url: z.string().optional().describe("Webpage URL to snapshot"),
+        file_base64: z.string().optional().describe("Base64 file content to attach"),
+        file_name: z.string().optional().describe("Filename for base64 attachment"),
+        extra: z.string().optional().describe("Extra field content"),
       },
-      async (params) => {
+      async (params, extra) => {
         const { apiKey, libraryId } = getCredentials();
-
+        const onProgress = makeProgressReporter(extra);
         const result = await createItem(apiKey, libraryId, {
           title: params.title,
           itemType: params.item_type,
@@ -594,17 +374,10 @@ export class ZoteroMCP extends McpAgent<Env> {
           collectionId: params.collection_id,
           pdfUrl: params.pdf_url,
           snapshotUrl: params.snapshot_url,
+          fileBase64: params.file_base64,
+          fileName: params.file_name,
           extra: params.extra,
-        });
-
-        if (result.success) {
-          (result as any).nextSteps = [
-            "Use attach_pdf or attach_snapshot to add more attachments",
-            "Use create_note to add analysis or summary",
-            "Use get_item to verify the saved metadata",
-          ];
-        }
-
+        }, onProgress);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -612,65 +385,37 @@ export class ZoteroMCP extends McpAgent<Env> {
     );
 
     this.server.tool(
-      "attach_pdf",
-      "Download a PDF from a URL and attach it to an existing Zotero item.",
+      "attach",
+      "Attach a file to an existing Zotero item. Supports PDF URLs, webpage snapshots, and base64 file content.",
       {
-        parent_item_key: z
-          .string()
-          .describe("The key of the parent item to attach to"),
-        pdf_url: z.string().url().describe("URL to download the PDF from"),
-        filename: z.string().optional().describe("Optional filename"),
+        parent_item_key: z.string().describe("Item key to attach to"),
+        source_type: z
+          .enum(["pdf_url", "snapshot_url", "file"])
+          .describe("Attachment type"),
+        url: z.string().optional().describe("URL (for pdf_url or snapshot_url types)"),
+        content_base64: z.string().optional().describe("Base64 content (for file type)"),
+        filename: z.string().optional().describe("Filename"),
+        title: z.string().optional().describe("Display title"),
+        content_type: z.string().optional().describe("MIME type (auto-detected if omitted)"),
       },
-      async ({ parent_item_key, pdf_url, filename }) => {
+      async (params, extra) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await attachPdfFromUrl(
-          apiKey,
-          libraryId,
-          parent_item_key,
-          pdf_url,
-          filename
-        );
+        const onProgress = makeProgressReporter(extra);
+        let result: any;
 
-        if (result.success) {
-          (result as any).nextSteps = [
-            "Use create_note to add analysis or summary of the PDF",
-            "Use get_item_fulltext to read the extracted text (after Zotero indexes it)",
-          ];
-        }
-
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-    );
-
-    this.server.tool(
-      "attach_snapshot",
-      "Save a webpage as an HTML snapshot and attach it to an existing Zotero item. Always call this for webpage sources — content can disappear.",
-      {
-        parent_item_key: z
-          .string()
-          .describe("The key returned by save_item"),
-        url: z.string().url().describe("URL of the webpage to snapshot"),
-        title: z
-          .string()
-          .optional()
-          .describe("Optional title for the snapshot"),
-      },
-      async ({ parent_item_key, url, title }) => {
-        const { apiKey, libraryId } = getCredentials();
-        const result = await attachSnapshot(
-          apiKey,
-          libraryId,
-          parent_item_key,
-          url,
-          title
-        );
-
-        if (result.success) {
-          (result as any).nextSteps = [
-            "Use create_note to add analysis or commentary",
-          ];
+        switch (params.source_type) {
+          case "pdf_url":
+            if (!params.url) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "url is required for pdf_url type" }) }] };
+            result = await attachPdfFromUrl(apiKey, libraryId, params.parent_item_key, params.url, params.filename, onProgress);
+            break;
+          case "snapshot_url":
+            if (!params.url) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "url is required for snapshot_url type" }) }] };
+            result = await attachSnapshot(apiKey, libraryId, params.parent_item_key, params.url, params.title, onProgress);
+            break;
+          case "file":
+            if (!params.content_base64 || !params.filename) return { content: [{ type: "text", text: JSON.stringify({ success: false, error: "content_base64 and filename are required for file type" }) }] };
+            result = await attachFile(apiKey, libraryId, params.parent_item_key, params.filename, params.content_base64, params.content_type, params.title, onProgress);
+            break;
         }
 
         return {
@@ -681,16 +426,11 @@ export class ZoteroMCP extends McpAgent<Env> {
 
     this.server.tool(
       "create_note",
-      "Create a new note attached to an existing Zotero item. Use this to add analysis, summaries, or observations. Supports HTML content.",
+      "Create a note attached to an existing item. Supports HTML content.",
       {
-        item_key: z
-          .string()
-          .describe("Parent item key to attach the note to"),
-        content: z.string().describe("Note text (supports HTML)"),
-        tags: z
-          .array(z.string())
-          .optional()
-          .describe("Tags to apply to the note"),
+        item_key: z.string().describe("Parent item key"),
+        content: z.string().describe("Note text (HTML supported)"),
+        tags: z.array(z.string()).optional().describe("Tags"),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
@@ -709,42 +449,48 @@ export class ZoteroMCP extends McpAgent<Env> {
 
     this.server.tool(
       "update_item",
-      "Update metadata on an existing Zotero item — fix titles, add/remove tags, move between collections, update abstracts.",
+      "Update metadata on an existing item. Pass only fields to change.",
       {
-        item_key: z.string().describe("The item key to update"),
-        title: z.string().optional().describe("New title"),
-        tags: z
-          .array(z.string())
+        item_key: z.string().describe("Item key to update"),
+        title: z.string().optional().describe("Title"),
+        url: z.string().optional().describe("URL"),
+        doi: z.string().optional().describe("DOI"),
+        publication: z.string().optional().describe("Publication name"),
+        volume: z.string().optional().describe("Volume"),
+        issue: z.string().optional().describe("Issue"),
+        pages: z.string().optional().describe("Pages"),
+        creators: z
+          .array(
+            z.object({
+              firstName: z.string().optional(),
+              lastName: z.string().optional(),
+              name: z.string().optional(),
+              creatorType: z.string().optional(),
+            })
+          )
           .optional()
-          .describe("Replacement tag array (replaces all tags)"),
-        add_tags: z
-          .array(z.string())
-          .optional()
-          .describe("Tags to add (preserves existing)"),
-        remove_tags: z
-          .array(z.string())
-          .optional()
-          .describe("Tags to remove"),
-        collections: z
-          .array(z.string())
-          .optional()
-          .describe("Replacement collection array (replaces all)"),
-        add_collections: z
-          .array(z.string())
-          .optional()
-          .describe("Add to collections (preserves existing memberships)"),
-        remove_collections: z
-          .array(z.string())
-          .optional()
-          .describe("Remove from collections (preserves others)"),
-        abstract: z.string().optional().describe("New abstract"),
-        date: z.string().optional().describe("New date"),
-        extra: z.string().optional().describe("New Extra field content"),
+          .describe("Replace all creators"),
+        tags: z.array(z.string()).optional().describe("Replace all tags"),
+        add_tags: z.array(z.string()).optional().describe("Add tags"),
+        remove_tags: z.array(z.string()).optional().describe("Remove tags"),
+        collections: z.array(z.string()).optional().describe("Replace all collections"),
+        add_collections: z.array(z.string()).optional().describe("Add to collections"),
+        remove_collections: z.array(z.string()).optional().describe("Remove from collections"),
+        abstract: z.string().optional().describe("Abstract"),
+        date: z.string().optional().describe("Date"),
+        extra: z.string().optional().describe("Extra field"),
       },
       async (params) => {
         const { apiKey, libraryId } = getCredentials();
         const result = await updateItem(apiKey, libraryId, params.item_key, {
           title: params.title,
+          url: params.url,
+          doi: params.doi,
+          publication: params.publication,
+          volume: params.volume,
+          issue: params.issue,
+          pages: params.pages,
+          creators: params.creators,
           tags: params.tags,
           add_tags: params.add_tags,
           remove_tags: params.remove_tags,
@@ -761,31 +507,15 @@ export class ZoteroMCP extends McpAgent<Env> {
       }
     );
 
-    // =====================================================================
-    // New Read Tools
-    // =====================================================================
-
     this.server.tool(
-      "get_attachment_content",
-      "Read the content of an attachment (HTML snapshot, text file, etc.). For PDFs, use get_item_fulltext instead. Pass the attachment's own item key (found in get_item children).",
+      "trash_item",
+      "Move a note or attachment to trash. Only works on notes/attachments for safety.",
       {
-        item_key: z.string().describe("The attachment item key (from get_item children array)"),
+        item_key: z.string().describe("Note or attachment key to trash"),
       },
-      async (params) => {
+      async ({ item_key }) => {
         const { apiKey, libraryId } = getCredentials();
-        const result = await getAttachmentContent(apiKey, libraryId, params.item_key);
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-    );
-
-    this.server.tool(
-      "get_library_stats",
-      "Get a quick overview of the library: total items, collections, and top tags. Use this instead of broad searches when the user asks 'what do I have?' or 'how many items?'.",
-      async () => {
-        const { apiKey, libraryId } = getCredentials();
-        const result = await getLibraryStats(apiKey, libraryId);
+        const result = await trashItem(apiKey, libraryId, item_key);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -805,7 +535,7 @@ export default {
     // Health check
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "zotero-assistant", version: "0.3.0", status: "ok" }),
+        JSON.stringify({ name: "zotero-assistant", version: "0.4.0", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }
